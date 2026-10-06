@@ -264,10 +264,11 @@ def refresh_process_table_contents():
         
     dpg.delete_item("ProcessTable", children_only=True)
     
-    dpg.add_table_column(label="PID / Group", parent="ProcessTable", width_fixed=True, width=120)
+    dpg.add_table_column(label="PID", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
+    dpg.add_table_column(label="Group", parent="ProcessTable", width_fixed=True, init_width_or_weight=40)
     dpg.add_table_column(label="Process Name", parent="ProcessTable")
-    dpg.add_table_column(label="CPU %", parent="ProcessTable", width_fixed=True, width=80)
-    dpg.add_table_column(label="Memory (MB)", parent="ProcessTable", width_fixed=True, width=100)
+    dpg.add_table_column(label="CPU %", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
+    dpg.add_table_column(label="Memory (MB)", parent="ProcessTable", width_fixed=True, init_width_or_weight=100)
     
     total_system_cpu_percentage = psutil.cpu_percent(interval=None) or 0.0
     system_memory_info = psutil.virtual_memory()
@@ -275,6 +276,7 @@ def refresh_process_table_contents():
     
     with dpg.table_row(parent="ProcessTable"):
         dpg.add_text("TOTAL", color=(255, 180, 0))
+        dpg.add_text("", color=(255, 180, 0))
         dpg.add_text("All System Processes & Kernel", color=(255, 180, 0))
         dpg.add_text(str(round(total_system_cpu_percentage, 1)), color=(255, 180, 0))
         dpg.add_text(str(total_system_used_memory_mb), color=(255, 180, 0))
@@ -288,27 +290,29 @@ def refresh_process_table_contents():
         instance_count = len(group_record['instances'])
         
         if instance_count > 1:
-            expansion_indicator_symbol = "[-] " if is_group_expanded else "[+] "
-            display_identifier_label = f"{expansion_indicator_symbol}({instance_count})"
+            expansion_indicator_symbol = "[-]" if is_group_expanded else "[+]"
+            group_indicator_text = f"({instance_count})"
         else:
-            display_identifier_label = str(group_record['instances'][0]['pid'])
+            expansion_indicator_symbol = str(group_record['instances'][0]['pid'])
+            group_indicator_text = ""
             
         with dpg.table_row(parent="ProcessTable"):
             if instance_count > 1:
                 dpg.add_selectable(
-                    label=display_identifier_label,
+                    label=expansion_indicator_symbol,
                     span_columns=True,
                     callback=toggle_group_expansion_callback,
                     user_data=group_name
                 )
             else:
                 dpg.add_selectable(
-                    label=display_identifier_label,
+                    label=expansion_indicator_symbol,
                     span_columns=True,
                     callback=handle_process_row_click,
                     user_data=group_record['instances'][0]
                 )
                 
+            dpg.add_text(group_indicator_text)
             dpg.add_text(group_name)
             dpg.add_text(str(round(group_record['total_cpu'], 1)))
             dpg.add_text(str(round(group_record['total_memory_mb'], 1)))
@@ -317,11 +321,12 @@ def refresh_process_table_contents():
             for child_process_instance in group_record['instances']:
                 with dpg.table_row(parent="ProcessTable"):
                     dpg.add_selectable(
-                        label=f"    └ {child_process_instance['pid']}",
+                        label=f"- {child_process_instance['pid']}",
                         span_columns=True,
                         callback=handle_process_row_click,
                         user_data=child_process_instance
                     )
+                    dpg.add_text("")
                     dpg.add_text(f"    {child_process_instance['name']}")
                     dpg.add_text(str(child_process_instance['cpu']))
                     dpg.add_text(str(child_process_instance['mem']))
@@ -341,10 +346,6 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     dpg.add_separator()
     
     with dpg.table(header_row=True, resizable=True, scrollY=True, height=400, tag="ProcessTable"):
-        dpg.add_table_column(label="PID / Group", width_fixed=True, width=120)
-        dpg.add_table_column(label="Process Name")
-        dpg.add_table_column(label="CPU %", width_fixed=True, width=80)
-        dpg.add_table_column(label="Memory (MB)", width_fixed=True, width=100)
         refresh_process_table_contents()
         
     dpg.add_spacer(height=10)
