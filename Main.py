@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import dearpygui.dearpygui as dpg
 import psutil
+import webbrowser
 
 # Database file for process descriptions
 DB_FILE = "process_cache.db"
@@ -106,6 +107,35 @@ def get_process_description(process_name):
         # Live fallback if added after startup scan
         return f"No documentation found for '{base_executable_name}'. Queued for AI analysis."
 
+URL_PATTERN = re.compile(r'https?://[^\s<>"\)\]]+')
+
+def open_link_callback(sender, app_data, url):
+    """Opens the clicked URL in the default browser."""
+    global was_click_on_process_row
+    # Stop the global click handler from clearing the description panel
+    was_click_on_process_row = True
+    webbrowser.open(url)
+
+def add_description_with_links(description_text, parent):
+    """Adds description text to the parent, turning any URLs into clickable links."""
+    for line in description_text.splitlines():
+        matches = list(URL_PATTERN.finditer(line))
+        if not matches:
+            dpg.add_text(line, wrap=900, parent=parent)
+            continue
+
+        with dpg.group(horizontal=True, horizontal_spacing=0, parent=parent):
+            position = 0
+            for match in matches:
+                url = match.group().rstrip('.,;:')   # drop trailing punctuation
+                if match.start() > position:
+                    dpg.add_text(line[position:match.start()])
+                link_button = dpg.add_button(label=url, callback=open_link_callback, user_data=url)
+                dpg.bind_item_theme(link_button, "LinkTheme")
+                position = match.start() + len(url)
+            if position < len(line):
+                dpg.add_text(line[position:])
+                
 def load_process_details_into_panel(process_pid, process_name):
     """Fetches process metadata, parent relationship, description, and populates the UI panel."""
     global is_table_refresh_paused, selected_process_pid
@@ -142,7 +172,15 @@ def load_process_details_into_panel(process_pid, process_name):
         dpg.add_spacer(height=5, parent="DescPanel")
 
     fetched_description = get_process_description(process_name)
-    dpg.add_text(fetched_description, wrap=900, parent="DescPanel")
+    add_description_with_links(fetched_description, "DescPanel")
+
+    with dpg.theme(tag="LinkTheme"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 255, 255, 30))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 255, 255, 60))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (90, 160, 255))
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
 
 def handle_process_row_click(sender, app_data, process_metadata):
     """Event handler triggered when a user clicks an individual process row or child instance."""
