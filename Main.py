@@ -52,7 +52,7 @@ def update_table():
     procs = get_filtered_processes()
     for p in procs:
         with dpg.table_row(parent="ProcessTable"):
-            dpg.add_text(str(p['pid']))
+            dpg.add_selectable(label=str(p['pid']), span_columns=True, callback=lambda s, u, p_data=p: select_process(p_data))
             dpg.add_text(p['name'])
             dpg.add_text(str(p['cpu']))
             dpg.add_text(str(p['mem']))
@@ -94,3 +94,4 @@ while dpg.is_dearpygui_running():
     dpg.render_dearpygui_frame()
 
 dpg.destroy_context()
+
