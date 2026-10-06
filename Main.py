@@ -2,8 +2,13 @@ import os
 import time
 import subprocess
 import re
+import sqlite3
+import threading
 import dearpygui.dearpygui as dpg
 import psutil
+
+# Database file for process descriptions
+DB_FILE = "process_cache.db"
 
 # Application state flags
 is_table_refresh_paused = False
@@ -22,45 +27,128 @@ total_system_cpu_count = psutil.cpu_count(logical=True) or 1
 # Prime system-wide CPU percentage baseline on startup
 psutil.cpu_percent(interval=None)
 
-def extract_manual_page_description(process_name):
-    """Executes the man command for the given process and extracts the DESCRIPTION text block."""
+def initialize_database():
+    """Initializes the SQLite database table for process descriptions if it doesn't exist."""
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS process_descriptions (
+                executable_name TEXT PRIMARY KEY,
+                description TEXT,
+                source TEXT,
+                needs_generation INTEGER DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+def initial_scan_processes():
+    """Scans currently active unique process names in the background, checks man pages, and flags unknowns for AI."""
+    unique_executables = set()
+    
+    for running_process in psutil.process_iter(['name']):
+        try:
+            name = running_process.info['name']
+            if name and not name.startswith('['):
+                base_name = name.split('/')[-1].split('.')[0]
+                unique_executables.add(base_name)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+            
+    with sqlite3.connect(DB_FILE) as connection:
+        cursor = connection.cursor()
+        for base_executable_name in unique_executables:
+            # Skip if already documented in the database
+            cursor.execute("SELECT 1 FROM process_descriptions WHERE executable_name = ?", (base_executable_name,))
+            if cursor.fetchone():
+                continue
+                
+            # Try fetching man page
+            try:
+                shell_command = f"man {base_executable_name} | col -b"
+                command_result = subprocess.run(shell_command, shell=True, capture_output=True, text=True, timeout=1)
+                
+                if command_result.returncode == 0:
+                    manual_output_text = command_result.stdout
+                    description_regex_match = re.search(r'(?:^|\n)(?:DESCRIPTION)\s*\n(.*?)(?=\n[A-Z\s]{3,}\n|\Z)', manual_output_text, re.DOTALL | re.IGNORECASE)
+                    
+                    if description_regex_match:
+                        raw_desc = description_regex_match.group(1).strip()
+                        cleaned_desc = '\n'.join([line.strip() for line in raw_desc.splitlines() if line.strip()])
+                        
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO process_descriptions (executable_name, description, source, needs_generation)
+                            VALUES (?, ?, 'man', 0)
+                        """, (base_executable_name, cleaned_desc))
+                        continue
+            except Exception:
+                pass
+                
+            # If no man page exists, insert stub and flag for agent generation
+            fallback_msg = f"No documentation found for '{base_executable_name}'. Queued for AI analysis."
+            cursor.execute("""
+                INSERT OR IGNORE INTO process_descriptions (executable_name, description, source, needs_generation)
+                VALUES (?, ?, 'pending', 1)
+            """, (base_executable_name, fallback_msg))
+            
+        connection.commit()
+
+def get_process_description(process_name):
+    """Queries DB first, falls back to live man check if missing, or returns queued status."""
     base_executable_name = process_name.split('/')[-1].split('.')[0]
     
-    try:
-        shell_command = f"man {base_executable_name} | col -b"
-        command_result = subprocess.run(shell_command, shell=True, capture_output=True, text=True, timeout=2)
+    with sqlite3.connect(DB_FILE) as connection:
+        cursor = connection.cursor()
+        cursor.execute("SELECT description FROM process_descriptions WHERE executable_name = ?", (base_executable_name,))
+        row = cursor.fetchone()
         
-        if command_result.returncode != 0:
-            return f"No manual page found for '{base_executable_name}'."
-            
-        manual_output_text = command_result.stdout
-        description_regex_match = re.search(r'(?:^|\n)(?:DESCRIPTION)\s*\n(.*?)(?=\n[A-Z\s]{3,}\n|\Z)', manual_output_text, re.DOTALL | re.IGNORECASE)
-        
-        if description_regex_match:
-            raw_description_text = description_regex_match.group(1).strip()
-            cleaned_description_lines = [line.strip() for line in raw_description_text.splitlines() if line.strip()]
-            return '\n'.join(cleaned_description_lines)
-            
-        return "Description section not found in manual page."
-    except subprocess.TimeoutExpired:
-        return "Timeout while fetching manual page."
-    except Exception as error_details:
-        return f"Could not load description: {error_details}"
+        if row and row[0]:
+            return row[0]
 
-def handle_process_row_click(sender, app_data, process_metadata):
-    """Event handler triggered when a user clicks an individual process row or child instance."""
-    global is_table_refresh_paused, selected_process_pid, was_click_on_process_row
+        # Live fallback if added after startup scan
+        return f"No documentation found for '{base_executable_name}'. Queued for AI analysis."
+
+def load_process_details_into_panel(process_pid, process_name):
+    """Fetches process metadata, parent relationship, description, and populates the UI panel."""
+    global is_table_refresh_paused, selected_process_pid
     
-    was_click_on_process_row = True
-    is_table_refresh_paused = True  # Freeze table updates so rows stop shifting
-    
-    process_pid = process_metadata['pid']
-    process_name = process_metadata['name']
+    is_table_refresh_paused = True
     selected_process_pid = process_pid
     
     dpg.set_value("SelectedHeader", f"Selected: PID {process_pid} ({process_name})")
-    fetched_description = extract_manual_page_description(process_name)
-    dpg.set_value("DescText", fetched_description)
+    
+    parent_metadata = None
+    try:
+        process_object = psutil.Process(process_pid)
+        parent_process = process_object.parent()
+        if parent_process:
+            parent_metadata = {
+                'pid': parent_process.pid,
+                'name': parent_process.name()
+            }
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+    dpg.delete_item("DescPanel", children_only=True)
+    
+    if parent_metadata:
+        dpg.add_text("Parent Process:", color=(200, 200, 100), parent="DescPanel")
+        dpg.add_button(
+            label=f"PID {parent_metadata['pid']} ({parent_metadata['name']})",
+            callback=lambda s, a, data: load_process_details_into_panel(data['pid'], data['name']),
+            user_data=parent_metadata,
+            parent="DescPanel"
+        )
+        dpg.add_spacer(height=5, parent="DescPanel")
+        dpg.add_separator(parent="DescPanel")
+        dpg.add_spacer(height=5, parent="DescPanel")
+
+    fetched_description = get_process_description(process_name)
+    dpg.add_text(fetched_description, wrap=900, parent="DescPanel")
+
+def handle_process_row_click(sender, app_data, process_metadata):
+    """Event handler triggered when a user clicks an individual process row or child instance."""
+    global was_click_on_process_row
+    was_click_on_process_row = True
+    load_process_details_into_panel(process_metadata['pid'], process_metadata['name'])
 
 def toggle_group_expansion_callback(sender, app_data, group_name):
     """Toggles the expansion state of an exact-name process group when clicked."""
@@ -82,13 +170,14 @@ def handle_global_mouse_click(sender, app_data):
     if not was_click_on_process_row:
         selected_process_pid = None
         is_table_refresh_paused = False
-        dpg.set_value("SelectedHeader", "Process Description (Manual Page)")
-        dpg.set_value("DescText", "Click a process row above to load its description...")
+        dpg.set_value("SelectedHeader", "Process Description (Database Cache)")
+        dpg.delete_item("DescPanel", children_only=True)
+        dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900, parent="DescPanel")
     else:
         was_click_on_process_row = False
 
 def fetch_filtered_user_processes():
-    """Fetches user-owned processes using persistent caching and PSS memory metrics to prevent shared memory inflation."""
+    """Fetches user-owned processes using PSS memory metrics and persistent caching."""
     global persistent_process_cache
     active_process_list = []
     current_logged_in_uid = os.getuid()
@@ -119,7 +208,6 @@ def fetch_filtered_user_processes():
             raw_per_core_cpu_percentage = target_process_object.cpu_percent(interval=None) or 0.0
             normalized_total_system_cpu = raw_per_core_cpu_percentage / total_system_cpu_count
             
-            # Use memory_full_info() to access PSS (Proportional Set Size) on Linux, falling back to RSS if unavailable
             process_full_memory_info = target_process_object.memory_full_info()
             process_memory_bytes = getattr(process_full_memory_info, 'pss', None)
             if process_memory_bytes is None:
@@ -238,6 +326,10 @@ def refresh_process_table_contents():
                     dpg.add_text(str(child_process_instance['cpu']))
                     dpg.add_text(str(child_process_instance['mem']))
 
+# Initialize database and spawn background scan thread
+initialize_database()
+threading.Thread(target=initial_scan_processes, daemon=True).start()
+
 # Initialize Dear PyGui context
 dpg.create_context()
 
@@ -258,7 +350,7 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     dpg.add_spacer(height=10)
     dpg.add_separator()
     
-    dpg.add_text("Process Description (Manual Page)", tag="SelectedHeader", color=(100, 200, 255))
+    dpg.add_text("Process Description (Database Cache)", tag="SelectedHeader", color=(100, 200, 255))
     with dpg.child_window(tag="DescPanel", height=180, border=True):
         dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900)
 
