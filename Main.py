@@ -174,14 +174,6 @@ def load_process_details_into_panel(process_pid, process_name):
     fetched_description = get_process_description(process_name)
     add_description_with_links(fetched_description, "DescPanel")
 
-    with dpg.theme(tag="LinkTheme"):
-        with dpg.theme_component(dpg.mvButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 255, 255, 30))
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 255, 255, 60))
-            dpg.add_theme_color(dpg.mvThemeCol_Text, (90, 160, 255))
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
-
 def handle_process_row_click(sender, app_data, process_metadata):
     """Event handler triggered when a user clicks an individual process row or child instance."""
     global was_click_on_process_row
@@ -270,7 +262,10 @@ def fetch_filtered_user_processes():
     return sorted(active_process_list, key=lambda process_item: process_item['cpu'], reverse=True)
 
 def aggregate_processes_by_exact_name(raw_process_list):
-    """Groups processes by their exact name, aggregating resource totals and tracking instances."""
+    """Groups processes by exact name, putting multi-instance groups first,
+
+    with both sections sorted descending by total CPU usage.
+    """
     aggregated_group_dictionary = {}
     
     for process_item in raw_process_list:
@@ -291,7 +286,10 @@ def aggregate_processes_by_exact_name(raw_process_list):
         
     return sorted(
         list(aggregated_group_dictionary.values()),
-        key=lambda group_record: group_record['total_cpu'],
+        key=lambda group_record: (
+            len(group_record['instances']) > 1,  # True (1) for groups, False (0) for single processes
+            group_record['total_cpu']            # Secondary sort by combined CPU usage
+        ),
         reverse=True
     )
 
@@ -320,6 +318,14 @@ def refresh_process_table_contents():
         dpg.add_text(str(total_system_used_memory_mb), color=(255, 180, 0))
         
     raw_processes = fetch_filtered_user_processes()
+
+    search_query = dpg.get_value("ProcessSearchFilter").strip().lower() if dpg.does_item_exist("ProcessSearchFilter") else ""
+    if search_query:
+        raw_processes = [
+            proc for proc in raw_processes 
+            if proc['name'].lower().startswith(search_query)  # Matches processes starting with search term
+        ]
+
     process_groups = aggregate_processes_by_exact_name(raw_processes)
     
     for group_record in process_groups:
@@ -376,15 +382,35 @@ threading.Thread(target=initial_scan_processes, daemon=True).start()
 # Initialize Dear PyGui context
 dpg.create_context()
 
+with dpg.theme(tag="LinkTheme"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 255, 255, 30))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 255, 255, 60))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (90, 160, 255))
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+
 with dpg.handler_registry():
     dpg.add_mouse_click_handler(callback=handle_global_mouse_click)
+    
+
 
 with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950, height=750):
     dpg.add_text("Filtered User Processes", color=(0, 255, 150))
+    
+    # Add search input bar
+    dpg.add_input_text(
+        label="Filter Processes",
+        tag="ProcessSearchFilter",
+        hint="Type to filter processes...",
+        callback=lambda s, a: refresh_process_table_contents()
+    )
+    
     dpg.add_separator()
     
+    # Define the table container (do not populate inside the with block)
     with dpg.table(header_row=True, resizable=True, scrollY=True, height=400, tag="ProcessTable"):
-        refresh_process_table_contents()
+        pass
         
     dpg.add_spacer(height=10)
     dpg.add_separator()
@@ -392,6 +418,9 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     dpg.add_text("Process Description (Database Cache)", tag="SelectedHeader", color=(100, 200, 255))
     with dpg.child_window(tag="DescPanel", height=180, border=True):
         dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900)
+
+# Initial population of the table now that all UI elements exist
+refresh_process_table_contents()
 
 dpg.create_viewport(title='Active Processor Monitor', width=1000, height=800)
 dpg.setup_dearpygui()
