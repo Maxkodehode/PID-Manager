@@ -58,12 +58,25 @@ def initial_scan_processes():
                 continue
                 
             try:
-                shell_command = f"man {base_executable_name} | col -b"
-                command_result = subprocess.run(shell_command, shell=True, capture_output=True, text=True, timeout=1)
+                env_override = os.environ.copy()
+                env_override["MANPAGER"] = "cat"
+
+                command_result = subprocess.run(
+                    ["man", base_executable_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                    env=env_override,
+                    shell=False
+                )
                 
                 if command_result.returncode == 0:
                     manual_output_text = command_result.stdout
-                    description_regex_match = re.search(r'(?:^|\n)(?:DESCRIPTION)\s*\n(.*?)(?=\n[A-Z\s]{3,}\n|\Z)', manual_output_text, re.DOTALL | re.IGNORECASE)
+                    description_regex_match = re.search(
+                        r'(?:^|\n)(?:DESCRIPTION)\s*\n(.*?)(?=\n[A-Z\s]{3,}\n|\Z)', 
+                        manual_output_text, 
+                        re.DOTALL | re.IGNORECASE
+                    )
                     
                     if description_regex_match:
                         raw_desc = description_regex_match.group(1).strip()
@@ -277,7 +290,6 @@ def aggregate_processes_by_exact_name(raw_process_list, sort_column="CPU %", is_
         group_record['total_memory_mb'] += process_item['mem']
         group_record['min_pid'] = min(group_record['min_pid'], process_item['pid'])
 
-    # Key extractor for sorting records
     def get_sort_key(record):
         if sort_column == "PID":
             return record['min_pid']
@@ -285,10 +297,9 @@ def aggregate_processes_by_exact_name(raw_process_list, sort_column="CPU %", is_
             return record['name'].lower()
         elif sort_column == "Memory (MB)":
             return record['total_memory_mb']
-        else:  # Default: "CPU %"
+        else:
             return record['total_cpu']
 
-    # Sort instances inside each expanded group
     for group_record in aggregated_group_dictionary.values():
         if len(group_record['instances']) > 1:
             if sort_column == "PID":
@@ -302,15 +313,12 @@ def aggregate_processes_by_exact_name(raw_process_list, sort_column="CPU %", is_
                 
             group_record['instances'].sort(key=instance_key, reverse=not is_ascending)
 
-    # Separate multi-instance process groups from single processes
     multi_groups = [g for g in aggregated_group_dictionary.values() if len(g['instances']) > 1]
     single_processes = [g for g in aggregated_group_dictionary.values() if len(g['instances']) == 1]
 
-    # Sort both lists independently
     multi_groups.sort(key=get_sort_key, reverse=not is_ascending)
     single_processes.sort(key=get_sort_key, reverse=not is_ascending)
 
-    # Return groups on top followed by single processes
     return multi_groups + single_processes
 
 def handle_table_sort_callback(sender, sort_specs):
@@ -320,12 +328,9 @@ def handle_table_sort_callback(sender, sort_specs):
     if not sort_specs:
         return
 
-    # Extract column tag/label and direction from Dear PyGui specs
-    # sort_specs format: [[column_id, direction_int]] where 1 = ascending (-1 or 0 = descending)
     column_id = sort_specs[0][0]
     direction = sort_specs[0][1]
     
-    # Map header tag back to name
     column_map = {
         "Col_PID": "PID",
         "Col_Name": "Process Name",
@@ -347,7 +352,6 @@ def refresh_process_table_contents():
         
     dpg.delete_item("ProcessTable", children_only=True)
     
-    # Set up sortable table columns with explicit tags
     dpg.add_table_column(label="PID", tag="Col_PID", user_data="Col_PID", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
     dpg.add_table_column(label="Group", parent="ProcessTable", width_fixed=True, init_width_or_weight=40, no_sort=True)
     dpg.add_table_column(label="Process Name", tag="Col_Name", user_data="Col_Name", parent="ProcessTable")
@@ -374,7 +378,6 @@ def refresh_process_table_contents():
             if proc['name'].lower().startswith(search_query)
         ]
 
-    # Group processes and sort according to current state
     process_groups = aggregate_processes_by_exact_name(
         raw_processes, 
         sort_column=current_sort_column, 
@@ -457,7 +460,6 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     
     dpg.add_separator()
     
-    # Enabled sortable=True and attached handle_table_sort_callback
     with dpg.table(
         header_row=True, 
         resizable=True, 
