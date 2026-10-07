@@ -8,24 +8,20 @@ import dearpygui.dearpygui as dpg
 import psutil
 import webbrowser
 
-# Database file for process descriptions
 DB_FILE = "process_cache.db"
 
-# Application state flags
 is_table_refresh_paused = False
 selected_process_pid = None
 was_click_on_process_row = False
+current_sort_column = "CPU %"
+current_sort_ascending = False
 
-# State tracking for expanded multi-instance process groups
 expanded_process_groups = set()
 
-# Global cache storing persistent psutil.Process objects across polling intervals
 persistent_process_cache = {}
 
-# Retrieve total logical CPU count for total-system percentage normalization
 total_system_cpu_count = psutil.cpu_count(logical=True) or 1
 
-# Prime system-wide CPU percentage baseline on startup
 psutil.cpu_percent(interval=None)
 
 def initialize_database():
@@ -57,12 +53,10 @@ def initial_scan_processes():
     with sqlite3.connect(DB_FILE) as connection:
         cursor = connection.cursor()
         for base_executable_name in unique_executables:
-            # Skip if already documented in the database
             cursor.execute("SELECT 1 FROM process_descriptions WHERE executable_name = ?", (base_executable_name,))
             if cursor.fetchone():
                 continue
                 
-            # Try fetching man page
             try:
                 shell_command = f"man {base_executable_name} | col -b"
                 command_result = subprocess.run(shell_command, shell=True, capture_output=True, text=True, timeout=1)
@@ -83,7 +77,6 @@ def initial_scan_processes():
             except Exception:
                 pass
                 
-            # If no man page exists, insert stub and flag for agent generation
             fallback_msg = f"No documentation found for '{base_executable_name}'. Queued for AI analysis."
             cursor.execute("""
                 INSERT OR IGNORE INTO process_descriptions (executable_name, description, source, needs_generation)
@@ -104,7 +97,6 @@ def get_process_description(process_name):
         if row and row[0]:
             return row[0]
 
-        # Live fallback if added after startup scan
         return f"No documentation found for '{base_executable_name}'. Queued for AI analysis."
 
 URL_PATTERN = re.compile(r'https?://[^\s<>"\)\]]+')
@@ -112,7 +104,6 @@ URL_PATTERN = re.compile(r'https?://[^\s<>"\)\]]+')
 def open_link_callback(sender, app_data, url):
     """Opens the clicked URL in the default browser."""
     global was_click_on_process_row
-    # Stop the global click handler from clearing the description panel
     was_click_on_process_row = True
     webbrowser.open(url)
 
@@ -127,7 +118,7 @@ def add_description_with_links(description_text, parent):
         with dpg.group(horizontal=True, horizontal_spacing=0, parent=parent):
             position = 0
             for match in matches:
-                url = match.group().rstrip('.,;:')   # drop trailing punctuation
+                url = match.group().rstrip('.,;:')
                 if match.start() > position:
                     dpg.add_text(line[position:match.start()])
                 link_button = dpg.add_button(label=url, callback=open_link_callback, user_data=url)
@@ -261,10 +252,10 @@ def fetch_filtered_user_processes():
             
     return sorted(active_process_list, key=lambda process_item: process_item['cpu'], reverse=True)
 
-def aggregate_processes_by_exact_name(raw_process_list):
-    """Groups processes by exact name, putting multi-instance groups first,
+def aggregate_processes_by_exact_name(raw_process_list, sort_column="CPU %", is_ascending=False):
+    """Groups processes by exact name, keeping multi-instance groups at the top
 
-    with both sections sorted descending by total CPU usage.
+    and sorting both groups and single processes according to the chosen column and direction.
     """
     aggregated_group_dictionary = {}
     
@@ -276,35 +267,92 @@ def aggregate_processes_by_exact_name(raw_process_list):
                 'name': process_name,
                 'instances': [],
                 'total_cpu': 0.0,
-                'total_memory_mb': 0.0
+                'total_memory_mb': 0.0,
+                'min_pid': process_item['pid']
             }
             
         group_record = aggregated_group_dictionary[process_name]
         group_record['instances'].append(process_item)
         group_record['total_cpu'] += process_item['cpu']
         group_record['total_memory_mb'] += process_item['mem']
-        
-    return sorted(
-        list(aggregated_group_dictionary.values()),
-        key=lambda group_record: (
-            len(group_record['instances']) > 1,  # True (1) for groups, False (0) for single processes
-            group_record['total_cpu']            # Secondary sort by combined CPU usage
-        ),
-        reverse=True
-    )
+        group_record['min_pid'] = min(group_record['min_pid'], process_item['pid'])
+
+    # Key extractor for sorting records
+    def get_sort_key(record):
+        if sort_column == "PID":
+            return record['min_pid']
+        elif sort_column == "Process Name":
+            return record['name'].lower()
+        elif sort_column == "Memory (MB)":
+            return record['total_memory_mb']
+        else:  # Default: "CPU %"
+            return record['total_cpu']
+
+    # Sort instances inside each expanded group
+    for group_record in aggregated_group_dictionary.values():
+        if len(group_record['instances']) > 1:
+            if sort_column == "PID":
+                instance_key = lambda x: x['pid']
+            elif sort_column == "Process Name":
+                instance_key = lambda x: x['name'].lower()
+            elif sort_column == "Memory (MB)":
+                instance_key = lambda x: x['mem']
+            else:
+                instance_key = lambda x: x['cpu']
+                
+            group_record['instances'].sort(key=instance_key, reverse=not is_ascending)
+
+    # Separate multi-instance process groups from single processes
+    multi_groups = [g for g in aggregated_group_dictionary.values() if len(g['instances']) > 1]
+    single_processes = [g for g in aggregated_group_dictionary.values() if len(g['instances']) == 1]
+
+    # Sort both lists independently
+    multi_groups.sort(key=get_sort_key, reverse=not is_ascending)
+    single_processes.sort(key=get_sort_key, reverse=not is_ascending)
+
+    # Return groups on top followed by single processes
+    return multi_groups + single_processes
+
+def handle_table_sort_callback(sender, sort_specs):
+    """Callback triggered whenever a table header column is clicked."""
+    global current_sort_column, current_sort_ascending
+    
+    if not sort_specs:
+        return
+
+    # Extract column tag/label and direction from Dear PyGui specs
+    # sort_specs format: [[column_id, direction_int]] where 1 = ascending (-1 or 0 = descending)
+    column_id = sort_specs[0][0]
+    direction = sort_specs[0][1]
+    
+    # Map header tag back to name
+    column_map = {
+        "Col_PID": "PID",
+        "Col_Name": "Process Name",
+        "Col_CPU": "CPU %",
+        "Col_Mem": "Memory (MB)"
+    }
+    
+    current_sort_column = column_map.get(dpg.get_item_user_data(column_id), "CPU %")
+    current_sort_ascending = (direction == 1)
+    
+    refresh_process_table_contents()
 
 def refresh_process_table_contents():
-    """Clears and repopulates the Dear PyGui table container with a system total row and grouped metrics."""
+    """Clears and repopulates the Dear PyGui table container with active process rows."""
+    global current_sort_column, current_sort_ascending
+    
     if not dpg.does_item_exist("ProcessTable"):
         return
         
     dpg.delete_item("ProcessTable", children_only=True)
     
-    dpg.add_table_column(label="PID", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
-    dpg.add_table_column(label="Group", parent="ProcessTable", width_fixed=True, init_width_or_weight=40)
-    dpg.add_table_column(label="Process Name", parent="ProcessTable")
-    dpg.add_table_column(label="CPU %", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
-    dpg.add_table_column(label="Memory (MB)", parent="ProcessTable", width_fixed=True, init_width_or_weight=100)
+    # Set up sortable table columns with explicit tags
+    dpg.add_table_column(label="PID", tag="Col_PID", user_data="Col_PID", parent="ProcessTable", width_fixed=True, init_width_or_weight=80)
+    dpg.add_table_column(label="Group", parent="ProcessTable", width_fixed=True, init_width_or_weight=40, no_sort=True)
+    dpg.add_table_column(label="Process Name", tag="Col_Name", user_data="Col_Name", parent="ProcessTable")
+    dpg.add_table_column(label="CPU %", tag="Col_CPU", user_data="Col_CPU", parent="ProcessTable", width_fixed=True, init_width_or_weight=80, prefer_sort_descending=True)
+    dpg.add_table_column(label="Memory (MB)", tag="Col_Mem", user_data="Col_Mem", parent="ProcessTable", width_fixed=True, init_width_or_weight=100, prefer_sort_descending=True)
     
     total_system_cpu_percentage = psutil.cpu_percent(interval=None) or 0.0
     system_memory_info = psutil.virtual_memory()
@@ -323,10 +371,15 @@ def refresh_process_table_contents():
     if search_query:
         raw_processes = [
             proc for proc in raw_processes 
-            if proc['name'].lower().startswith(search_query)  # Matches processes starting with search term
+            if proc['name'].lower().startswith(search_query)
         ]
 
-    process_groups = aggregate_processes_by_exact_name(raw_processes)
+    # Group processes and sort according to current state
+    process_groups = aggregate_processes_by_exact_name(
+        raw_processes, 
+        sort_column=current_sort_column, 
+        is_ascending=current_sort_ascending
+    )
     
     for group_record in process_groups:
         group_name = group_record['name']
@@ -374,12 +427,9 @@ def refresh_process_table_contents():
                     dpg.add_text(f"    {child_process_instance['name']}")
                     dpg.add_text(str(child_process_instance['cpu']))
                     dpg.add_text(str(child_process_instance['mem']))
-
-# Initialize database and spawn background scan thread
 initialize_database()
 threading.Thread(target=initial_scan_processes, daemon=True).start()
 
-# Initialize Dear PyGui context
 dpg.create_context()
 
 with dpg.theme(tag="LinkTheme"):
@@ -398,7 +448,6 @@ with dpg.handler_registry():
 with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950, height=750):
     dpg.add_text("Filtered User Processes", color=(0, 255, 150))
     
-    # Add search input bar
     dpg.add_input_text(
         label="Filter Processes",
         tag="ProcessSearchFilter",
@@ -408,8 +457,16 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     
     dpg.add_separator()
     
-    # Define the table container (do not populate inside the with block)
-    with dpg.table(header_row=True, resizable=True, scrollY=True, height=400, tag="ProcessTable"):
+    # Enabled sortable=True and attached handle_table_sort_callback
+    with dpg.table(
+        header_row=True, 
+        resizable=True, 
+        scrollY=True, 
+        height=400, 
+        tag="ProcessTable",
+        sortable=True,
+        callback=handle_table_sort_callback
+    ):
         pass
         
     dpg.add_spacer(height=10)
@@ -419,7 +476,6 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     with dpg.child_window(tag="DescPanel", height=180, border=True):
         dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900)
 
-# Initial population of the table now that all UI elements exist
 refresh_process_table_contents()
 
 dpg.create_viewport(title='Active Processor Monitor', width=1000, height=800)
