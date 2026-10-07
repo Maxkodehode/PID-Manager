@@ -7,6 +7,7 @@ import threading
 import dearpygui.dearpygui as dpg
 import psutil
 import webbrowser
+import signal
 
 DB_FILE = "process_cache.db"
 
@@ -147,7 +148,9 @@ def load_process_details_into_panel(process_pid, process_name):
     is_table_refresh_paused = True
     selected_process_pid = process_pid
     
-    dpg.set_value("SelectedHeader", f"Selected: PID {process_pid} ({process_name})")
+    dpg.set_item_user_data("SelectedHeaderButton", {"pid": process_pid, "name": process_name})
+    
+    dpg.set_item_label("SelectedHeaderButton", f"Selected: PID {process_pid} ({process_name}) [Click for Actions]")
     
     parent_metadata = None
     try:
@@ -177,19 +180,32 @@ def load_process_details_into_panel(process_pid, process_name):
 
     fetched_description = get_process_description(process_name)
     add_description_with_links(fetched_description, "DescPanel")
-
+    
+    
 def handle_process_row_click(sender, app_data, process_metadata):
-    """Event handler triggered when a user clicks an individual process row or child instance."""
-    global was_click_on_process_row
+    """Event handler triggered when clicking an individual process or filtered process row."""
+    global was_click_on_process_row, selected_process_pid
     was_click_on_process_row = True
+    
+    selected_process_pid = process_metadata['pid']
     load_process_details_into_panel(process_metadata['pid'], process_metadata['name'])
-
-def toggle_group_expansion_callback(sender, app_data, group_name):
-    """Toggles the expansion state of an exact-name process group when clicked."""
-    global expanded_process_groups, is_table_refresh_paused, was_click_on_process_row
+    
+    
+def toggle_group_expansion_callback(sender, app_data, group_record):
+    """Toggles group expansion and sets selected_process_pid to the primary process PID of the group."""
+    global expanded_process_groups, is_table_refresh_paused, was_click_on_process_row, selected_process_pid
+    
     was_click_on_process_row = True
     is_table_refresh_paused = True
     
+    if isinstance(group_record, dict):
+        group_name = group_record['name']
+        if group_record.get('instances'):
+            primary_pid = group_record['instances'][0]['pid']
+            load_process_details_into_panel(primary_pid, group_name)
+    else:
+        group_name = str(group_record)
+
     if group_name in expanded_process_groups:
         expanded_process_groups.remove(group_name)
     else:
@@ -204,11 +220,84 @@ def handle_global_mouse_click(sender, app_data):
     if not was_click_on_process_row:
         selected_process_pid = None
         is_table_refresh_paused = False
-        dpg.set_value("SelectedHeader", "Process Description (Database Cache)")
+        dpg.set_item_label("SelectedHeaderButton", "Process Description (Database Cache)")
         dpg.delete_item("DescPanel", children_only=True)
         dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900, parent="DescPanel")
     else:
         was_click_on_process_row = False
+
+def terminate_selected_process(sig=signal.SIGTERM):
+    """Fetches the target PID dynamically from the header button on menu invocation and executes signal."""
+    global selected_process_pid, is_table_refresh_paused, was_click_on_process_row
+    
+    was_click_on_process_row = True
+
+    button_data = dpg.get_item_user_data("SelectedHeaderButton")
+    
+    if not button_data or not isinstance(button_data, dict) or "pid" not in button_data:
+        dpg.delete_item("DescPanel", children_only=True)
+        dpg.add_text("[-] ERROR: No process PID is currently selected or loaded.", color=(255, 100, 100), parent="DescPanel")
+        return
+
+    pid = button_data["pid"]
+    proc_name = button_data.get("name", "Unknown")
+
+    dpg.delete_item("DescPanel", children_only=True)
+    dpg.add_text("--- Process Termination Command Log ---", color=(100, 200, 255), parent="DescPanel")
+    dpg.add_spacer(height=5, parent="DescPanel")
+    
+    signal_names = {
+        signal.SIGTERM: "SIGTERM (Safe Termination)",
+        signal.SIGKILL: "SIGKILL (Force Kill)",
+        signal.SIGHUP: "SIGHUP (Reload Config)"
+    }
+    sig_label = signal_names.get(sig, f"Signal {sig}")
+
+    try:
+        proc = psutil.Process(pid)
+        proc_name = proc.name()
+        
+        dpg.add_text(f"[*] Targeting PID {pid} ({proc_name})...", parent="DescPanel")
+        dpg.add_text(f"[*] Dispatching signal: {sig_label}", parent="DescPanel")
+        
+        if sig == signal.SIGKILL:
+            proc.kill()
+        elif sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.send_signal(sig)
+
+        try:
+            proc.wait(timeout=0.5)
+            dpg.add_text(f"[+] SUCCESS: Process {pid} ({proc_name}) terminated successfully.", color=(0, 255, 150), parent="DescPanel")
+        except psutil.TimeoutExpired:
+            dpg.add_text(f"[!] NOTICE: Signal sent to PID {pid}, but process has not exited yet.", color=(255, 200, 0), parent="DescPanel")
+
+        dpg.set_item_user_data("SelectedHeaderButton", None)
+        selected_process_pid = None
+        is_table_refresh_paused = False
+        refresh_process_table_contents()
+
+    except psutil.AccessDenied:
+        dpg.add_text(
+            f"[-] ERROR: Permission Denied! Unable to terminate PID {pid}.\n"
+            f"    The process is owned by another user/session or requires root privileges.",
+            color=(255, 100, 100),
+            wrap=900,
+            parent="DescPanel"
+        )
+        print(f"Permission denied when sending {sig_label} to PID {pid}.")
+
+    except psutil.NoSuchProcess:
+        dpg.add_text(f"[-] ERROR: Process PID {pid} no longer exists.", color=(255, 100, 100), parent="DescPanel")
+        dpg.set_item_user_data("SelectedHeaderButton", None)
+        selected_process_pid = None
+        is_table_refresh_paused = False
+        refresh_process_table_contents()
+
+    except Exception as err:
+        dpg.add_text(f"[-] ERROR: Unexpected exception: {err}", color=(255, 100, 100), wrap=900, parent="DescPanel")
+        print(f"Error terminating PID {pid}: {err}")
 
 def fetch_filtered_user_processes():
     """Fetches user-owned processes using PSS memory metrics and persistent caching."""
@@ -217,8 +306,11 @@ def fetch_filtered_user_processes():
     current_logged_in_uid = os.getuid()
     current_pids_discovered = set()
     
-    for running_process in psutil.process_iter(['pid', 'name', 'uids']):
+    for running_process in psutil.process_iter(['pid', 'name', 'uids', 'status']):
         try:
+            if running_process.info['status'] in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                continue
+
             process_user_ids = running_process.info['uids']
             if process_user_ids and process_user_ids.real != current_logged_in_uid:
                 continue
@@ -345,7 +437,7 @@ def handle_table_sort_callback(sender, sort_specs):
 
 def refresh_process_table_contents():
     """Clears and repopulates the Dear PyGui table container with active process rows."""
-    global current_sort_column, current_sort_ascending
+    global current_sort_column, current_sort_ascending, selected_process_pid
     
     if not dpg.does_item_exist("ProcessTable"):
         return
@@ -375,7 +467,7 @@ def refresh_process_table_contents():
     if search_query:
         raw_processes = [
             proc for proc in raw_processes 
-            if proc['name'].lower().startswith(search_query)
+            if search_query in proc['name'].lower()
         ]
 
     process_groups = aggregate_processes_by_exact_name(
@@ -402,7 +494,7 @@ def refresh_process_table_contents():
                     label=expansion_indicator_symbol,
                     span_columns=True,
                     callback=toggle_group_expansion_callback,
-                    user_data=group_name
+                    user_data=group_record
                 )
             else:
                 dpg.add_selectable(
@@ -430,6 +522,7 @@ def refresh_process_table_contents():
                     dpg.add_text(f"    {child_process_instance['name']}")
                     dpg.add_text(str(child_process_instance['cpu']))
                     dpg.add_text(str(child_process_instance['mem']))
+                    
 initialize_database()
 threading.Thread(target=initial_scan_processes, daemon=True).start()
 
@@ -474,7 +567,27 @@ with dpg.window(label="Active Processor Monitor", tag="PrimaryWindow", width=950
     dpg.add_spacer(height=10)
     dpg.add_separator()
     
-    dpg.add_text("Process Description (Database Cache)", tag="SelectedHeader", color=(100, 200, 255))
+    dpg.add_button(
+        label="Process Description (Database Cache)", 
+        tag="SelectedHeaderButton"
+    )
+    
+    with dpg.popup("SelectedHeaderButton", mousebutton=dpg.mvMouseButton_Left):
+      dpg.add_text("Process Actions:")
+      dpg.add_separator()
+      dpg.add_menu_item(
+          label="Terminate (SIGTERM - Safe)", 
+          callback=lambda: terminate_selected_process(signal.SIGTERM)
+      )
+      dpg.add_menu_item(
+          label="Kill Immediately (SIGKILL - Force)", 
+          callback=lambda: terminate_selected_process(signal.SIGKILL)
+      )
+      dpg.add_menu_item(
+          label="Reload Config (SIGHUP)", 
+          callback=lambda: terminate_selected_process(signal.SIGHUP)
+      )
+
     with dpg.child_window(tag="DescPanel", height=180, border=True):
         dpg.add_text("Click a process row above to load its description...", tag="DescText", wrap=900)
 
